@@ -771,40 +771,40 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
                 np.load(f, mmap_mode=m) for f in self.labels_paths
             ]
         len_d0 = len(self.dense_arrs[0])
-        # second_half_start_index = int(len_d0 // 2 + len_d0 % 2)
-        # if stage == "val":
-        #     self.dense_arrs[0] = self.dense_arrs[0][:second_half_start_index, :]
-        #     self.sparse_arrs[0] = self.sparse_arrs[0][:second_half_start_index, :]
-        #     self.labels_arrs[0] = self.labels_arrs[0][:second_half_start_index, :]
-        # elif stage == "test":
-        #     self.dense_arrs[0] = self.dense_arrs[0][second_half_start_index:, :]
-        #     self.sparse_arrs[0] = self.sparse_arrs[0][second_half_start_index:, :]
-        #     self.labels_arrs[0] = self.labels_arrs[0][second_half_start_index:, :]
-        
+
         train_ratio = args.train_ratio
+        continue_train_start_ratio = args.continue_train_start_ratio
         val_ratio = args.val_ratio
-        test_ratio = args.test_ratio #最后10%数据作为test
+        test_start_ratio = args.test_start_ratio
+        test_end_ratio = args.test_end_ratio
         faiss_ratio = args.faiss_ratio
         
-        val_start_index = int(len_d0 * train_ratio)
-        faiss_ratio = int(len_d0 * faiss_ratio)
-        test_start_index = int(len_d0 * (1 - test_ratio))
+        continue_train_start_index = int(len_d0 * continue_train_start_ratio)
+        train_end_index = int(len_d0 * train_ratio)
+        faiss_start_index = int(len_d0 * faiss_ratio)
+        test_start_index = int(len_d0 * test_start_ratio)
+        test_end_index = int(len_d0 * test_end_ratio)
+        # test_start_index = int(len_d0 * (1 - test_ratio))
         if stage == "train":
-            self.dense_arrs[0] = self.dense_arrs[0][:val_start_index, :]
-            self.sparse_arrs[0] = self.sparse_arrs[0][:val_start_index, :]
-            self.labels_arrs[0] = self.labels_arrs[0][:val_start_index, :]
+            self.dense_arrs[0] = self.dense_arrs[0][:train_end_index, :]
+            self.sparse_arrs[0] = self.sparse_arrs[0][:train_end_index, :]
+            self.labels_arrs[0] = self.labels_arrs[0][:train_end_index, :]
+        elif stage == "continue_train":
+            self.dense_arrs[0] = self.dense_arrs[0][continue_train_start_index:train_end_index, :]
+            self.sparse_arrs[0] = self.sparse_arrs[0][continue_train_start_index:train_end_index, :]
+            self.labels_arrs[0] = self.labels_arrs[0][continue_train_start_index:train_end_index, :]
         elif stage == "val" and val_ratio > 0:
-            self.dense_arrs[0] = self.dense_arrs[0][val_start_index:test_start_index, :]
-            self.sparse_arrs[0] = self.sparse_arrs[0][val_start_index:test_start_index, :]
-            self.labels_arrs[0] = self.labels_arrs[0][val_start_index:test_start_index, :]
+            self.dense_arrs[0] = self.dense_arrs[0][train_end_index:test_start_index, :]
+            self.sparse_arrs[0] = self.sparse_arrs[0][train_end_index:test_start_index, :]
+            self.labels_arrs[0] = self.labels_arrs[0][train_end_index:test_start_index, :]
         elif stage == "test":
-            self.dense_arrs[0] = self.dense_arrs[0][test_start_index:, :]
-            self.sparse_arrs[0] = self.sparse_arrs[0][test_start_index:, :]
-            self.labels_arrs[0] = self.labels_arrs[0][test_start_index:, :]
+            self.dense_arrs[0] = self.dense_arrs[0][test_start_index:test_end_index, :]
+            self.sparse_arrs[0] = self.sparse_arrs[0][test_start_index:test_end_index, :]
+            self.labels_arrs[0] = self.labels_arrs[0][test_start_index:test_end_index, :]
         elif stage == "faiss":
-            self.dense_arrs[0] = self.dense_arrs[0][val_start_index:faiss_ratio, :]
-            self.sparse_arrs[0] = self.sparse_arrs[0][val_start_index:faiss_ratio, :]
-            self.labels_arrs[0] = self.labels_arrs[0][val_start_index:faiss_ratio, :]
+            self.dense_arrs[0] = self.dense_arrs[0][train_end_index:faiss_start_index, :]
+            self.sparse_arrs[0] = self.sparse_arrs[0][train_end_index:faiss_start_index, :]
+            self.labels_arrs[0] = self.labels_arrs[0][train_end_index:faiss_start_index, :]
         # When mmap_mode is enabled, sparse features are hashed when
         # samples are batched in def __iter__. Otherwise, the dataset has been
         # preloaded with sparse features hashed in the preload stage, here:

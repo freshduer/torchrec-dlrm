@@ -797,9 +797,10 @@ class DLRM(nn.Module):
                 )
                 nn.init.zeros_(self.lora_Bs[table_name].weight)
             
-            # 冻结原始嵌入参数
-            for param in embedding_bag_collection.parameters():
-                param.requires_grad = False
+            # 冻结 sparse_arch, dense_arch, inter_arch, over_arch 模块中的参数
+            for module in [self.sparse_arch, self.dense_arch, self.inter_arch, self.over_arch]:
+                for param in module.parameters():
+                    param.requires_grad = False
 
     def forward(
         self,
