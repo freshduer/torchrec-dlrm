@@ -18,7 +18,6 @@ from torchrec.modules.mlp import MLP
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 import faiss
 import numpy as np
-import time
 
 def choose(n: int, k: int) -> int:
     """
@@ -112,137 +111,7 @@ class SparseArch(nn.Module):
     @property
     def sparse_feature_names(self) -> List[str]:
         return self._sparse_feature_names
-    
-from torchrec.sparse.tensor_dict import maybe_td_to_kjt
-from torchrec.modules.embedding_modules import process_pooled_embeddings, reorder_inverse_indices
-import torch.nn.functional as F
-torch.fx.wrap('process_pooled_embeddings')
-torch.fx.wrap('reorder_inverse_indices')
-class __SparseArch(nn.Module):
-    def __init__(
-        self,
-        embedding_bag_collection: EmbeddingBagCollection,
-        use_lora: bool = False,
-    ) -> None:
-        super().__init__()
-        self.embedding_bag_collection = embedding_bag_collection
-        assert (
-            self.embedding_bag_collection.embedding_bag_configs
-        ), "Embedding bag collection cannot be empty!"
-        self.D: int = self.embedding_bag_collection.embedding_bag_configs()[0].embedding_dim
-        self.configs = embedding_bag_collection.embedding_bag_configs()
-        self._sparse_feature_names: List[str] = [
-            name
-            for conf in embedding_bag_collection.embedding_bag_configs()
-            for name in conf.feature_names
-        ]
-        self.F = len(self._sparse_feature_names)
-        self._is_weighted = False
-        
-        self.use_lora = use_lora
-        self.lora_rank = 4
-        if self.use_lora:
-            assert self.lora_rank > 0, "lora_rank must be positive when use_lora is True"
-        
-        # Mapping from feature name to table name
-        self.feature_to_table = {}
-        for config in self.embedding_bag_collection.embedding_bag_configs():
-            for feature_name in config.feature_names:
-                self.feature_to_table[feature_name] = config.name
-        self._feature_names = self.embedding_bag_collection._feature_names
-        
-        # Initialize LoRA parameters if needed
-        if self.use_lora:
-            self.lora_As = nn.ModuleDict()
-            self.lora_Bs = nn.ModuleDict()
-            for config in self.configs:
-                table_name = config.name
-                original_embedding_bag = self.embedding_bag_collection.embedding_bags[table_name]
-                num_embeddings = config.num_embeddings
-                embedding_dim = config.embedding_dim
-                
-                # LoRA A matrix (EmbeddingBag)
-                self.lora_As[table_name] = nn.EmbeddingBag(
-                    num_embeddings=num_embeddings,
-                    embedding_dim=self.lora_rank,
-                    mode=original_embedding_bag.mode,
-                    include_last_offset=original_embedding_bag.include_last_offset
-                )
-                nn.init.zeros_(self.lora_As[table_name].weight)
-                
-                # LoRA B matrix (EmbeddingBag)
-                self.lora_Bs[table_name] = nn.EmbeddingBag(
-                    num_embeddings=self.lora_rank,  # 目标维度
-                    embedding_dim=embedding_dim,  # 输入维度
-                    mode='sum',  # 或者根据需求选择 'mean' 或 'max'
-                    include_last_offset=False  # 根据需求设置
-                )
-                nn.init.normal_(self.lora_Bs[table_name].weight, mean=0.0, std=0.01)
-            
-            # Freeze original embedding bags
-            for param in self.embedding_bag_collection.parameters():
-                param.requires_grad = False
 
-    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
-        """
-        Args:
-            features (KeyedJaggedTensor): an input tensor of sparse features.
-
-        Returns:
-            torch.Tensor: tensor of shape B X F X D.
-        """
-
-        # Get the sparse features from the embedding bag collection
-        sparse_features: KeyedTensor = self.embedding_bag_collection(features)
-        sparse: Dict[str, torch.Tensor] = sparse_features.to_dict()
-        sparse_values: List[torch.Tensor] = []
-
-        for name in self._sparse_feature_names:
-            feature_tensor = sparse[name]
-
-            if self.use_lora:
-                # Get the table name associated with the feature
-                table_name = self.feature_to_table[name]
-                
-                # Apply LoRA A transformation using F.embedding_bag
-                flat_feature_names: List[str] = []
-                features = maybe_td_to_kjt(features, None)
-                for names in self._feature_names:
-                    flat_feature_names.extend(names)
-                inverse_indices = reorder_inverse_indices(
-                    inverse_indices=features.inverse_indices_or_none(),
-                    feature_names=flat_feature_names,
-                )
-                feature_dict = features.to_dict()
-                print(f"feature_dict:{feature_dict}")
-                print(f"name:{name}")
-                f = feature_dict[name]
-                lora_A_output = self.lora_As[table_name](
-                    input=f.values(),
-                    offsets=f.offsets(),
-                    per_sample_weights=(
-                        f.weights().to(self.lora_As[table_name].weight.dtype)
-                        if self._is_weighted
-                        else None
-                    ),
-                ).float()
-                lora_A_output=process_pooled_embeddings(
-                    pooled_embeddings=lora_A_output,
-                    inverse_indices=inverse_indices,
-                ),
-                    
-                # Apply LoRA B transformation
-                lora_B_output = self.lora_Bs[table_name]
-                feature_tensor += (lora_A_output @ lora_B_output.weight)
-
-            sparse_values.append(feature_tensor)
-
-        # Concatenate and reshape the resulting tensor
-        return torch.cat(sparse_values, dim=1).reshape(-1, self.F, self.D)
-    
-    @property
-    def sparse_feature_names(self) -> List[str]:
-        return self._sparse_feature_names
 
 class DenseArch(nn.Module):
     """
@@ -569,7 +438,7 @@ class OverArch(nn.Module):
         return self.model(features)
 
 
-class __DLRM(nn.Module):
+class DLRM(nn.Module):
     """
     Recsys model from "Deep Learning Recommendation Model for Personalization and
     Recommendation Systems" (https://arxiv.org/abs/1906.00091). Processes sparse
@@ -647,6 +516,7 @@ class __DLRM(nn.Module):
         dense_arch_layer_sizes: List[int],
         over_arch_layer_sizes: List[int],
         dense_device: Optional[torch.device] = None,
+        faiss_index: faiss.IndexFlatL2 = None,
     ) -> None:
         super().__init__()
         assert (
@@ -693,6 +563,12 @@ class __DLRM(nn.Module):
         self.faiss_flag = False
         self.test_use_faiss_flag = False
 
+    def add_embeddings_to_faiss(self, embeddings: torch.Tensor) -> None:
+        """
+        Adds embeddings to the FAISS index.
+        """
+        self.faiss_index.add(embeddings.cpu().numpy())
+
     def average_topk_embeddings(self, embeddings, k=5):
         D, I = self.faiss_index.search(embeddings.cpu().numpy(), k)
         topk_embeddings = self.faiss_index.reconstruct_n(I, k)
@@ -713,134 +589,14 @@ class __DLRM(nn.Module):
         """
         embedded_dense = self.dense_arch(dense_features)
         embedded_sparse = self.sparse_arch(sparse_features)
-
+        if self.test_use_faiss_flag:
+            embedded_sparse = self.average_topk_embeddings(embedded_sparse)
         concatenated_dense = self.inter_arch(
             dense_features=embedded_dense, sparse_features=embedded_sparse
         )
         logits = self.over_arch(concatenated_dense)
         return logits
 
-class DLRM(nn.Module):
-    def __init__(
-        self,
-        embedding_bag_collection: EmbeddingBagCollection,
-        dense_in_features: int,
-        dense_arch_layer_sizes: List[int],
-        over_arch_layer_sizes: List[int],
-        dense_device: Optional[torch.device] = None,
-        use_lora: bool = False,
-        lora_rank: int = 4,  # 新增LoRA秩参数
-    ) -> None:
-        super().__init__()
-        # 确保所有嵌入表维度一致
-        assert (
-            len(embedding_bag_collection.embedding_bag_configs()) > 0
-        ), "At least one embedding bag is required"
-        for i in range(1, len(embedding_bag_collection.embedding_bag_configs())):
-            conf_prev = embedding_bag_collection.embedding_bag_configs()[i - 1]
-            conf = embedding_bag_collection.embedding_bag_configs()[i]
-            assert (
-                conf_prev.embedding_dim == conf.embedding_dim
-            ), "All EmbeddingBagConfigs must have the same dimension"
-        embedding_dim: int = embedding_bag_collection.embedding_bag_configs()[
-            0
-        ].embedding_dim
-        if dense_arch_layer_sizes[-1] != embedding_dim:
-            raise ValueError(
-                f"Embedding dimension ({embedding_dim}) must match final dense arch layer size ({dense_arch_layer_sizes[-1]})"
-            )
-
-        # 初始化不包含LoRA的SparseArch
-        self.sparse_arch = SparseArch(embedding_bag_collection)
-        num_sparse_features = len(self.sparse_arch.sparse_feature_names)
-
-        # 其他组件初始化
-        self.dense_arch = DenseArch(dense_in_features, dense_arch_layer_sizes, dense_device)
-        self.inter_arch = InteractionArch(num_sparse_features)
-        over_in_features = embedding_dim + (num_sparse_features * (num_sparse_features + 1)) // 2
-        self.over_arch = OverArch(over_in_features, over_arch_layer_sizes, dense_device)
-        
-        # LoRA相关初始化
-        self.use_lora = use_lora
-        self.lora_rank = lora_rank
-        if self.use_lora:
-            self.lora_As = nn.ModuleDict()
-            self.lora_Bs = nn.ModuleDict()
-            self.feature_to_table = {}
-            
-            # 构建特征到表的映射
-            for config in embedding_bag_collection.embedding_bag_configs():
-                for feature_name in config.feature_names:
-                    self.feature_to_table[feature_name] = config.name
-                
-                # 为每个表初始化LoRA参数
-                table_name = config.name
-                num_embeddings = config.num_embeddings
-                embedding_dim = config.embedding_dim
-                original_embedding_bag = embedding_bag_collection.embedding_bags[table_name]
-                
-                # LoRA A矩阵: 从原始维度映射到低秩空间
-                self.lora_As[table_name] = nn.EmbeddingBag(
-                    num_embeddings=num_embeddings,
-                    embedding_dim=lora_rank,
-                    mode=original_embedding_bag.mode,
-                    include_last_offset=embedding_bag_collection.embedding_bags[table_name].include_last_offset
-                )
-                nn.init.normal_(self.lora_As[table_name].weight, mean=0.0, std=0.01)
-                
-                # LoRA B矩阵: 从低秩空间映射回原始维度
-                self.lora_Bs[table_name] = nn.EmbeddingBag(
-                    num_embeddings=self.lora_rank,  # 目标维度
-                    embedding_dim=embedding_dim,  # 输入维度
-                    mode='sum',  # 或者根据需求选择 'mean' 或 'max'
-                    include_last_offset=False  # 根据需求设置
-                )
-                nn.init.zeros_(self.lora_Bs[table_name].weight)
-            
-            # 冻结原始嵌入参数
-            for param in embedding_bag_collection.parameters():
-                param.requires_grad = False
-
-    def forward(
-        self,
-        dense_features: torch.Tensor,
-        sparse_features: KeyedJaggedTensor,
-    ) -> torch.Tensor:
-        # 常规前向传播
-        embedded_dense = self.dense_arch(dense_features)
-        embedded_sparse = self.sparse_arch(sparse_features)  # [B, F, D]
-        
-        # LoRA调整
-        if self.use_lora:
-            batch_size, num_features, emb_dim = embedded_sparse.shape
-            lora_adjustments = []
-            
-            # 为每个特征计算LoRA调整
-            for feature_name in self.sparse_arch.sparse_feature_names:
-                table_name = self.feature_to_table[feature_name]
-                feature_data = sparse_features[feature_name]
-                
-                # 通过LoRA A获取低秩表示
-                lora_A_output = self.lora_As[table_name](
-                    input=feature_data.values(),
-                    offsets=feature_data.offsets(),
-                    per_sample_weights=feature_data.weights_or_none()
-                )  # 形状: [B, lora_rank]
-                
-                # 通过LoRA B投影回原始空间
-                lora_B_output = lora_A_output @ self.lora_Bs[table_name].weight  # 形状: [B, D]
-                
-                # 将调整量添加到列表
-                lora_adjustments.append(lora_B_output.unsqueeze(1))  # [B, 1, D]
-            # 合并所有调整量
-            lora_adjustment = torch.cat(lora_adjustments, dim=1)  # [B, F, D]
-            
-            # 应用调整
-            embedded_sparse += lora_adjustment
-        
-        # 后续处理
-        concatenated = self.inter_arch(embedded_dense, embedded_sparse)
-        return self.over_arch(concatenated)
 
 class DLRM_Projection(DLRM):
     """

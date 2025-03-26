@@ -94,7 +94,7 @@ def get_embedding_names_by_table(
     return embedding_names_by_table
 
 
-class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
+class __EmbeddingBagCollection(EmbeddingBagCollectionInterface):
     """
     EmbeddingBagCollection represents a collection of pooled embeddings (`EmbeddingBags`).
 
@@ -302,6 +302,239 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
             # pyre-ignore
             table_config.init_fn(param)
 
+import torch.nn.functional as F
+import math
+
+class CoLREmbeddingBag(nn.EmbeddingBag):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        r: int = 4,
+        **kwargs
+    ):
+        assert r > 0, "LoRA rank 'r' must be greater than 0."
+        self._r = r
+        self.merged = False
+        self._is_lora_initialized = False
+        super().__init__(num_embeddings, embedding_dim, **kwargs)
+        self._A = nn.Parameter(torch.zeros((num_embeddings, r), device=self.weight.device))
+        self._B = nn.Parameter(torch.zeros((r, embedding_dim), device=self.weight.device))
+        self.register_buffer('_scaling', torch.tensor([1.0], device=self.weight.device))
+        # Freeze original weight and B matrix
+        print(f"LoRA _A initialized? {hasattr(self, '_A')}")
+        self.weight.requires_grad_(False)
+        self._B.requires_grad_(False)
+        self._is_lora_initialized = True
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        if self._is_lora_initialized:
+            self.reset_lowrank_parameters(init_B_strategy='zeros', keep_B=False)
+
+    @torch.no_grad()
+    def reset_lowrank_parameters(
+        self, 
+        init_B_strategy: str = 'zeros', 
+        keep_B: bool = False, 
+        scale_norm: float = 1.0
+    ) -> None:
+        nn.init.zeros_(self._A)
+        if not keep_B:
+            if init_B_strategy == "random":
+                nn.init.normal_(self._B, mean=0, std=scale_norm * math.sqrt(1 / self._r))
+            elif init_B_strategy == "l2norm":
+                nn.init.normal_(self._B)
+                self._B.data /= torch.linalg.norm(self._B.data, dim=1, keepdim=True)
+                self._B.data *= scale_norm
+            elif init_B_strategy == "orthnorm":
+                nn.init.normal_(self._B)
+                U, S, Vh = torch.linalg.svd(self._B, full_matrices=False)
+                self._B.data = (U @ Vh) * math.sqrt(self.embedding_dim / self._r)
+                self._B.data *= scale_norm
+            elif init_B_strategy == 'zeros':
+                nn.init.zeros_(self._B)
+            else:
+                raise ValueError(f"Unknown init_B_strategy: {init_B_strategy}")
+        self.merged = False
+
+    def merge_lowrank_weights(self) -> None:
+        if not self.merged:
+            with torch.no_grad():
+                self.weight.data += (self._A @ self._B) * self._scaling
+            self.merged = True
+
+    def forward(self, input: torch.Tensor, offsets: torch.Tensor = None, per_sample_weights: torch.Tensor = None) -> torch.Tensor:
+        base_output = super().forward(input, offsets, per_sample_weights)
+        if self.merged:
+            return base_output
+        # Compute LoRA contribution
+        lora_emb = F.embedding_bag(
+            input,
+            self._A,
+            offsets,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.mode,
+            self.sparse,
+            per_sample_weights,
+            self.include_last_offset,
+            self.padding_idx,
+        )
+        lora_output = (lora_emb @ self._B) * self._scaling
+        return base_output + lora_output
+
+class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
+    def __init__(
+        self,
+        tables: List[EmbeddingBagConfig],
+        is_weighted: bool = False,
+        device: Optional[torch.device] = None,
+        lora_ranks: Optional[Dict[str, int]] = None,  # 新增参数
+    ) -> None:
+        super().__init__()
+        torch._C._log_api_usage_once(f"torchrec.modules.{self.__class__.__name__}")
+        self._is_weighted = is_weighted
+        self.embedding_bags: nn.ModuleDict = nn.ModuleDict()
+        self._embedding_bag_configs = tables
+        self._lengths_per_embedding: List[int] = []
+        self.lora_ranks = lora_ranks or {}  # 处理空字典
+
+        table_names = set()
+        for embedding_config in tables:
+            if embedding_config.name in table_names:
+                raise ValueError(f"Duplicate table name {embedding_config.name}")
+            table_names.add(embedding_config.name)
+            
+            # 获取LoRA配置
+            r = self.lora_ranks.get(embedding_config.name, 0)
+            
+            # 根据r选择嵌入类型
+            if r > 0:
+                embedding_cls = CoLREmbeddingBag
+                extra_kwargs = {'r': r}
+            else:
+                embedding_cls = nn.EmbeddingBag
+                extra_kwargs = {}
+            
+            dtype = (
+                torch.float32
+                if embedding_config.data_type == DataType.FP32
+                else torch.float16
+            )
+            
+            self.embedding_bags[embedding_config.name] = embedding_cls(
+                num_embeddings=embedding_config.num_embeddings,
+                embedding_dim=embedding_config.embedding_dim,
+                mode=pooling_type_to_str(embedding_config.pooling),
+                device=device,
+                include_last_offset=True,
+                dtype=dtype,
+                **extra_kwargs  # 传递r参数
+            )
+            
+            if device is None:
+                device = self.embedding_bags[embedding_config.name].weight.device
+
+            if not embedding_config.feature_names:
+                embedding_config.feature_names = [embedding_config.name]
+            self._lengths_per_embedding.extend(
+                len(embedding_config.feature_names) * [embedding_config.embedding_dim]
+            )
+
+        self._device: torch.device = device or torch.device("cpu")
+        self._embedding_names: List[str] = [
+            embedding
+            for embeddings in get_embedding_names_by_table(tables)
+            for embedding in embeddings
+        ]
+        self._feature_names: List[List[str]] = [table.feature_names for table in tables]
+        self.reset_parameters()
+
+    def forward(
+        self,
+        features: KeyedJaggedTensor,  # can also take TensorDict as input
+    ) -> KeyedTensor:
+        """
+        Run the EmbeddingBagCollection forward pass. This method takes in a `KeyedJaggedTensor`
+        and returns a `KeyedTensor`, which is the result of pooling the embeddings for each feature.
+
+        Args:
+            features (KeyedJaggedTensor): Input KJT
+        Returns:
+            KeyedTensor
+        """
+        flat_feature_names: List[str] = []
+        features = maybe_td_to_kjt(features, None)
+        for names in self._feature_names:
+            flat_feature_names.extend(names)
+        inverse_indices = reorder_inverse_indices(
+            inverse_indices=features.inverse_indices_or_none(),
+            feature_names=flat_feature_names,
+        )
+        pooled_embeddings: List[torch.Tensor] = []
+        feature_dict = features.to_dict()
+        for i, embedding_bag in enumerate(self.embedding_bags.values()):
+            for feature_name in self._feature_names[i]:
+                f = feature_dict[feature_name]
+                res = embedding_bag(
+                    input=f.values(),
+                    offsets=f.offsets(),
+                    per_sample_weights=(
+                        f.weights().to(embedding_bag.weight.dtype)
+                        if self._is_weighted
+                        else None
+                    ),
+                ).float()
+                pooled_embeddings.append(res)
+        return KeyedTensor(
+            keys=self._embedding_names,
+            values=process_pooled_embeddings(
+                pooled_embeddings=pooled_embeddings,
+                inverse_indices=inverse_indices,
+            ),
+            length_per_key=self._lengths_per_embedding,
+        )
+
+    def is_weighted(self) -> bool:
+        """
+        Returns:
+            bool: Whether the EmbeddingBagCollection is weighted.
+        """
+        return self._is_weighted
+
+    def embedding_bag_configs(self) -> List[EmbeddingBagConfig]:
+        """
+        Returns:
+            List[EmbeddingBagConfig]: The embedding bag configs.
+        """
+        return self._embedding_bag_configs
+
+    @property
+    def device(self) -> torch.device:
+        """
+        Returns:
+            torch.device: The compute device.
+        """
+        return self._device
+
+    def reset_parameters(self) -> None:
+        """
+        Reset the parameters of the EmbeddingBagCollection. Parameter values
+        are intiialized based on the `init_fn` of each EmbeddingBagConfig if it exists.
+        """
+        if (isinstance(self.device, torch.device) and self.device.type == "meta") or (
+            isinstance(self.device, str) and self.device == "meta"
+        ):
+            return
+        # Initialize embedding bags weights with init_fn
+        for table_config in self._embedding_bag_configs:
+            assert table_config.init_fn is not None
+            param = self.embedding_bags[f"{table_config.name}"].weight
+            # pyre-ignore
+            table_config.init_fn(param)
 
 class EmbeddingCollectionInterface(abc.ABC, nn.Module):
     """

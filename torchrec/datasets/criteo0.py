@@ -770,7 +770,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
             self.labels_arrs: List[np.ndarray] = [
                 np.load(f, mmap_mode=m) for f in self.labels_paths
             ]
-        len_d0 = len(self.dense_arrs[0])
+        # len_d0 = len(self.dense_arrs[0])
         # second_half_start_index = int(len_d0 // 2 + len_d0 % 2)
         # if stage == "val":
         #     self.dense_arrs[0] = self.dense_arrs[0][:second_half_start_index, :]
@@ -780,7 +780,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         #     self.dense_arrs[0] = self.dense_arrs[0][second_half_start_index:, :]
         #     self.sparse_arrs[0] = self.sparse_arrs[0][second_half_start_index:, :]
         #     self.labels_arrs[0] = self.labels_arrs[0][second_half_start_index:, :]
-        
+        len_d0 = len(self.dense_arrs[0])
         train_ratio = args.train_ratio
         val_ratio = args.val_ratio
         test_ratio = args.test_ratio #最后10%数据作为test
@@ -789,6 +789,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         val_start_index = int(len_d0 * train_ratio)
         faiss_ratio = int(len_d0 * faiss_ratio)
         test_start_index = int(len_d0 * (1 - test_ratio))
+        
         if stage == "train":
             self.dense_arrs[0] = self.dense_arrs[0][:val_start_index, :]
             self.sparse_arrs[0] = self.sparse_arrs[0][:val_start_index, :]
