@@ -94,7 +94,7 @@ def get_embedding_names_by_table(
     return embedding_names_by_table
 
 
-class __EmbeddingBagCollection(EmbeddingBagCollectionInterface):
+class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
     """
     EmbeddingBagCollection represents a collection of pooled embeddings (`EmbeddingBags`).
 
@@ -322,9 +322,7 @@ class CoLREmbeddingBag(nn.EmbeddingBag):
         self._B = nn.Parameter(torch.zeros((r, embedding_dim), device=self.weight.device))
         self.register_buffer('_scaling', torch.tensor([1.0], device=self.weight.device))
         # Freeze original weight and B matrix
-        print(f"LoRA _A initialized? {hasattr(self, '_A')}")
         self.weight.requires_grad_(False)
-        self._B.requires_grad_(False)
         self._is_lora_initialized = True
         self.reset_parameters()
 
@@ -386,7 +384,7 @@ class CoLREmbeddingBag(nn.EmbeddingBag):
         lora_output = (lora_emb @ self._B) * self._scaling
         return base_output + lora_output
 
-class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
+class __EmbeddingBagCollection(EmbeddingBagCollectionInterface):
     def __init__(
         self,
         tables: List[EmbeddingBagConfig],

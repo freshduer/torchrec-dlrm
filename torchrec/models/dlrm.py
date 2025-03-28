@@ -16,7 +16,6 @@ from torchrec.modules.crossnet import LowRankCrossNet
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.modules.mlp import MLP
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
-import faiss
 import numpy as np
 import time
 
@@ -720,6 +719,8 @@ class __DLRM(nn.Module):
         logits = self.over_arch(concatenated_dense)
         return logits
 
+from collections import defaultdict
+from torch.fx.proxy import Proxy
 class DLRM(nn.Module):
     def __init__(
         self,
@@ -729,75 +730,54 @@ class DLRM(nn.Module):
         over_arch_layer_sizes: List[int],
         dense_device: Optional[torch.device] = None,
         use_lora: bool = False,
-        lora_rank: int = 4,  # 新增LoRA秩参数
+        lora_rank: int = 8,
     ) -> None:
         super().__init__()
-        # 确保所有嵌入表维度一致
-        assert (
-            len(embedding_bag_collection.embedding_bag_configs()) > 0
-        ), "At least one embedding bag is required"
-        for i in range(1, len(embedding_bag_collection.embedding_bag_configs())):
-            conf_prev = embedding_bag_collection.embedding_bag_configs()[i - 1]
-            conf = embedding_bag_collection.embedding_bag_configs()[i]
-            assert (
-                conf_prev.embedding_dim == conf.embedding_dim
-            ), "All EmbeddingBagConfigs must have the same dimension"
-        embedding_dim: int = embedding_bag_collection.embedding_bag_configs()[
-            0
-        ].embedding_dim
+        # 原始参数校验保持不变
+        assert len(embedding_bag_collection.embedding_bag_configs()) > 0, "需要至少一个EmbeddingBag"
+        embedding_dim = embedding_bag_collection.embedding_bag_configs()[0].embedding_dim
+        for config in embedding_bag_collection.embedding_bag_configs()[1:]:
+            assert config.embedding_dim == embedding_dim, "所有EmbeddingBag维度需一致"
         if dense_arch_layer_sizes[-1] != embedding_dim:
-            raise ValueError(
-                f"Embedding dimension ({embedding_dim}) must match final dense arch layer size ({dense_arch_layer_sizes[-1]})"
-            )
+            raise ValueError("Dense输出维度需与Embedding维度一致")
 
-        # 初始化不包含LoRA的SparseArch
+        # 初始化模块
         self.sparse_arch = SparseArch(embedding_bag_collection)
-        num_sparse_features = len(self.sparse_arch.sparse_feature_names)
-
-        # 其他组件初始化
         self.dense_arch = DenseArch(dense_in_features, dense_arch_layer_sizes, dense_device)
-        self.inter_arch = InteractionArch(num_sparse_features)
-        over_in_features = embedding_dim + (num_sparse_features * (num_sparse_features + 1)) // 2
+        self.inter_arch = InteractionArch(len(self.sparse_arch.sparse_feature_names))
+        over_in_features = embedding_dim + (len(self.sparse_arch.sparse_feature_names) * (len(self.sparse_arch.sparse_feature_names) + 1)) // 2
         self.over_arch = OverArch(over_in_features, over_arch_layer_sizes, dense_device)
         
         # LoRA相关初始化
         self.use_lora = use_lora
-        self.lora_rank = lora_rank
         if self.use_lora:
+            self.lora_rank = lora_rank
+            self.feature_to_table = {}
+            self.table_indices = defaultdict(set)
             self.lora_As = nn.ModuleDict()
             self.lora_Bs = nn.ModuleDict()
-            self.feature_to_table = {}
             
             # 构建特征到表的映射
             for config in embedding_bag_collection.embedding_bag_configs():
                 for feature_name in config.feature_names:
                     self.feature_to_table[feature_name] = config.name
-                
-                # 为每个表初始化LoRA参数
+                # 初始化LoRA参数
                 table_name = config.name
-                num_embeddings = config.num_embeddings
-                embedding_dim = config.embedding_dim
                 original_embedding_bag = embedding_bag_collection.embedding_bags[table_name]
-                
-                # LoRA A矩阵: 从原始维度映射到低秩空间
+                # LoRA A使用与原EmbeddingBag相同的配置
                 self.lora_As[table_name] = nn.EmbeddingBag(
-                    num_embeddings=num_embeddings,
+                    num_embeddings=config.num_embeddings,
                     embedding_dim=lora_rank,
                     mode=original_embedding_bag.mode,
-                    include_last_offset=embedding_bag_collection.embedding_bags[table_name].include_last_offset
+                    include_last_offset=original_embedding_bag.include_last_offset
                 )
-                nn.init.normal_(self.lora_As[table_name].weight, mean=0.0, std=0.01)
-                
-                # LoRA B矩阵: 从低秩空间映射回原始维度
-                self.lora_Bs[table_name] = nn.EmbeddingBag(
-                    num_embeddings=self.lora_rank,  # 目标维度
-                    embedding_dim=embedding_dim,  # 输入维度
-                    mode='sum',  # 或者根据需求选择 'mean' 或 'max'
-                    include_last_offset=False  # 根据需求设置
-                )
-                nn.init.zeros_(self.lora_Bs[table_name].weight)
+                # nn.init.normal_(self.lora_As[table_name].weight, mean=0.0, std=0.01)
+                nn.init.zeros_(self.lora_As[table_name].weight)
+                # LoRA B使用线性层
+                self.lora_Bs[table_name] = nn.Linear(embedding_dim, lora_rank, bias=False)
+                nn.init.normal_(self.lora_Bs[table_name].weight, mean=0.0, std=0.01)
             
-            # 冻结 sparse_arch, dense_arch, inter_arch, over_arch 模块中的参数
+            # 冻结原始参数
             for module in [self.sparse_arch, self.dense_arch, self.inter_arch, self.over_arch]:
                 for param in module.parameters():
                     param.requires_grad = False
@@ -807,30 +787,59 @@ class DLRM(nn.Module):
         dense_features: torch.Tensor,
         sparse_features: KeyedJaggedTensor,
     ) -> torch.Tensor:
-        # 常规前向传播
         embedded_dense = self.dense_arch(dense_features)
         embedded_sparse = self.sparse_arch(sparse_features)  # [B, F, D]
         
-        # LoRA调整
         if self.use_lora:
             batch_size, num_features, emb_dim = embedded_sparse.shape
             lora_adjustments = []
             
-            # 为每个特征计算LoRA调整
             for feature_name in self.sparse_arch.sparse_feature_names:
                 table_name = self.feature_to_table[feature_name]
                 feature_data = sparse_features[feature_name]
+                indices = feature_data.values()
+                offsets = feature_data.offsets()
+
+                # 训练时记录索引
+                if self.training and not isinstance(indices, Proxy):
+                    self.table_indices[table_name].update(indices.cpu().numpy().tolist())
                 
-                # 通过LoRA A获取低秩表示
-                lora_A_output = self.lora_As[table_name](
-                    input=feature_data.values(),
-                    offsets=feature_data.offsets(),
-                    per_sample_weights=feature_data.weights_or_none()
-                )  # 形状: [B, lora_rank]
-                
+                if self.training:
+                    # 通过LoRA A获取低秩表示
+                    lora_A_output = self.lora_As[table_name](
+                        input=indices,
+                        offsets=offsets,
+                        per_sample_weights=feature_data.weights_or_none()
+                    )  # 形状: [B, lora_rank]
+                else:
+                    if not isinstance(indices, Proxy):
+                        print(f"indices shape:{indices.shape}")
+
+                        # 获取已记录索引
+                        recorded = self.table_indices.get(table_name, set())
+                        print(f"recorded.shape:{len(recorded)}")  # set 没有 shape，改为 len()
+
+                        if not recorded:
+                            lora_adjustments.append(torch.zeros(batch_size, 1, emb_dim, device=embedded_sparse.device))
+                            continue
+
+                        # 生成索引掩码（True 表示需要保留，False 表示要置零）
+                        mask = torch.isin(indices, torch.tensor(list(recorded), device=indices.device))
+
+                        # 计算 LoRA A 的输出
+                        lora_A_output = self.lora_As[table_name](
+                            indices,  # 直接使用原始 indices
+                            offsets,
+                            feature_data.weights_or_none() if feature_data.weights_or_none() is not None else None
+                        )
+
+                        # 直接用 mask 过滤输出
+                        lora_A_output *= mask.view(-1, 1)  # 适配 [2048, 4]
+
                 # 通过LoRA B投影回原始空间
                 lora_B_output = lora_A_output @ self.lora_Bs[table_name].weight  # 形状: [B, D]
-                
+                lora_B_output = torch.zeros_like(lora_B_output)
+
                 # 将调整量添加到列表
                 lora_adjustments.append(lora_B_output.unsqueeze(1))  # [B, 1, D]
             # 合并所有调整量
