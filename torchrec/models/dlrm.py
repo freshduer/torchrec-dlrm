@@ -813,11 +813,11 @@ class DLRM(nn.Module):
                     )  # 形状: [B, lora_rank]
                 else:
                     if not isinstance(indices, Proxy):
-                        print(f"indices shape:{indices.shape}")
+                        # print(f"indices shape:{indices.shape}")
 
                         # 获取已记录索引
                         recorded = self.table_indices.get(table_name, set())
-                        print(f"recorded.shape:{len(recorded)}")  # set 没有 shape，改为 len()
+                        # print(f"recorded.shape:{len(recorded)}")  # set 没有 shape，改为 len()
 
                         if not recorded:
                             lora_adjustments.append(torch.zeros(batch_size, 1, emb_dim, device=embedded_sparse.device))
