@@ -94,7 +94,7 @@ def get_embedding_names_by_table(
     return embedding_names_by_table
 
 
-class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
+class __EmbeddingBagCollection(EmbeddingBagCollectionInterface):
     """
     EmbeddingBagCollection represents a collection of pooled embeddings (`EmbeddingBags`).
 
@@ -310,7 +310,7 @@ class CoLREmbeddingBag(nn.EmbeddingBag):
         self,
         num_embeddings: int,
         embedding_dim: int,
-        r: int = 4,
+        r: int = 8,
         **kwargs
     ):
         assert r > 0, "LoRA rank 'r' must be greater than 0."
@@ -323,18 +323,19 @@ class CoLREmbeddingBag(nn.EmbeddingBag):
         self.register_buffer('_scaling', torch.tensor([1.0], device=self.weight.device))
         # Freeze original weight and B matrix
         self.weight.requires_grad_(False)
+        self._B.requires_grad_(True)
         self._is_lora_initialized = True
         self.reset_parameters()
 
     def reset_parameters(self):
         super().reset_parameters()
         if self._is_lora_initialized:
-            self.reset_lowrank_parameters(init_B_strategy='zeros', keep_B=False)
+            self.reset_lowrank_parameters(init_B_strategy='orthnorm', keep_B=False)
 
     @torch.no_grad()
     def reset_lowrank_parameters(
         self, 
-        init_B_strategy: str = 'zeros', 
+        init_B_strategy: str = 'orthnorm', 
         keep_B: bool = False, 
         scale_norm: float = 1.0
     ) -> None:
@@ -384,7 +385,7 @@ class CoLREmbeddingBag(nn.EmbeddingBag):
         lora_output = (lora_emb @ self._B) * self._scaling
         return base_output + lora_output
 
-class __EmbeddingBagCollection(EmbeddingBagCollectionInterface):
+class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
     def __init__(
         self,
         tables: List[EmbeddingBagConfig],

@@ -567,8 +567,8 @@ class OverArch(nn.Module):
         """
         return self.model(features)
 
-
-class __DLRM(nn.Module):
+import math
+class DLRM(nn.Module):
     """
     Recsys model from "Deep Learning Recommendation Model for Personalization and
     Recommendation Systems" (https://arxiv.org/abs/1906.00091). Processes sparse
@@ -646,6 +646,7 @@ class __DLRM(nn.Module):
         dense_arch_layer_sizes: List[int],
         over_arch_layer_sizes: List[int],
         dense_device: Optional[torch.device] = None,
+        use_lora: bool = False
     ) -> None:
         super().__init__()
         assert (
@@ -688,14 +689,15 @@ class __DLRM(nn.Module):
             layer_sizes=over_arch_layer_sizes,
             device=dense_device,
         )
-        self.faiss_index = faiss_index
-        self.faiss_flag = False
-        self.test_use_faiss_flag = False
-
-    def average_topk_embeddings(self, embeddings, k=5):
-        D, I = self.faiss_index.search(embeddings.cpu().numpy(), k)
-        topk_embeddings = self.faiss_index.reconstruct_n(I, k)
-        return torch.tensor(np.mean(topk_embeddings, axis=1), device=embeddings.device)
+        if use_lora:
+            first_embedding = next(iter(self.sparse_arch.embedding_bag_collection.embedding_bags.values()))
+            scale_grad_A = math.sqrt(first_embedding._r / embedding_dim)
+            for config in embedding_bag_collection.embedding_bag_configs():
+                    for feature_name in config.feature_names:
+                        self.sparse_arch.embedding_bag_collection.embedding_bags[f"t_{feature_name}"]._A.register_hook(lambda grad: grad * scale_grad_A)
+            for module in [self.dense_arch, self.inter_arch, self.over_arch]:
+                    for param in module.parameters():
+                        param.requires_grad = False
 
     def forward(
         self,
@@ -721,7 +723,7 @@ class __DLRM(nn.Module):
 
 from collections import defaultdict
 from torch.fx.proxy import Proxy
-class DLRM(nn.Module):
+class __DLRM(nn.Module):
     def __init__(
         self,
         embedding_bag_collection: EmbeddingBagCollection,
