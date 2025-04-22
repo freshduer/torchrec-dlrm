@@ -425,7 +425,7 @@ def save_initial_embeddings(model):
     保存模型中所有 embedding 参数的初始值。
     """
     for name, param in model.named_parameters():
-        if "embedding" in name and param.requires_grad:
+        if "embedding" in name:
             initial_embeddings[name] = param.detach().clone()
 
 def calculate_embedding_changes(model):
@@ -523,7 +523,6 @@ def main(argv: List[str]) -> None:
         nhead=args.nhead,
         num_layers=args.num_layers,
     ).to(device)
-    save_initial_embeddings(model_bert4rec)
     if use_dmp:
         fused_params: Dict[str, Any] = {}
         fused_params["optimizer"] = EmbOptimType.ADAM
@@ -581,7 +580,7 @@ def main(argv: List[str]) -> None:
     lr_scheduler = optim.lr_scheduler.StepLR(
         optimizer, step_size=args.decay_step, gamma=args.gamma
     )
-
+    save_initial_embeddings(model_bert4rec)
     train_val_test(
         model,
         train_loader,
@@ -597,7 +596,8 @@ def main(argv: List[str]) -> None:
         args.export_root,
     )
     total_change_bytes, total_change_gb = calculate_embedding_changes(model_bert4rec)
-    print(f"Embedding param change: {total_change_bytes} bytes ({total_change_gb:.2f} GB)")
+    total_change_mb = total_change_bytes /(1024**2)
+    print(f"Embedding param change: {total_change_bytes} bytes total_change_mb:{total_change_mb:.2}MB ({total_change_gb:.2f} GB)")
 
 
 if __name__ == "__main__":
