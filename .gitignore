@@ -144,3 +144,4 @@ pipeline.yaml
 
 #torchxconfig
 *.torchxconfig
+settings.json
