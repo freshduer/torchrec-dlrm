@@ -81,6 +81,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="minimum item count for each valid user",
     )
     parser.add_argument(
+        "--cpu_only",
+        type=bool,
+        default=False,
+        help="minimum item count for each valid user",
+    )
+    parser.add_argument(
         "--max_len",
         type=int,
         default=100,
@@ -411,7 +417,35 @@ def train_val_test(
             print(f"epoch {epoch + 1} model has been saved to {export_root}")
     _validate(model, test_loader, device, num_epochs, metric_ks, True)
 
+# 用于保存初始 embedding 参数
+initial_embeddings = {}
 
+def save_initial_embeddings(model):
+    """
+    保存模型中所有 embedding 参数的初始值。
+    """
+    for name, param in model.named_parameters():
+        if "embedding" in name and param.requires_grad:
+            initial_embeddings[name] = param.detach().clone()
+
+def calculate_embedding_changes(model):
+    total_change_bytes = 0
+    for name, param in model.named_parameters():
+        if name in initial_embeddings:
+            change = torch.abs(param.detach() - initial_embeddings[name])
+            # print(f"change.shape:{change.shape}")
+            if change.ndim >= 2:
+                changed_rows = (change.sum(dim=1) != 0)
+                num_changed_rows = changed_rows.sum().item()
+                # print(f"num_changed_rows:{num_changed_rows}")
+                param_per_row = change.shape[1]
+                total_change_bytes += num_changed_rows * param_per_row * change.element_size()
+            else:
+                changed_elements = (change != 0).sum().item()
+                total_change_bytes += changed_elements * change.element_size()
+
+    total_change_gb = total_change_bytes / (1024 ** 3)
+    return total_change_bytes, total_change_gb 
 def main(argv: List[str]) -> None:
     """
     Trains, validates, and tests a Bert4Rec Model
@@ -435,12 +469,14 @@ def main(argv: List[str]) -> None:
         [1, 5, 10, 20, 50, 100] if args.dataset_name != "random" else [1, 5, 10]
     )
     rank = int(os.environ["LOCAL_RANK"])
-    if torch.cuda.is_available():
+    if not args.cpu_only and torch.cuda.is_available():
         device = torch.device(f"cuda:{rank}")
+        print(f"device:{device}")
         backend = "nccl"
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
+        print(f"device:{device}")
         backend = "gloo"
 
     if not torch.distributed.is_initialized():
@@ -487,6 +523,7 @@ def main(argv: List[str]) -> None:
         nhead=args.nhead,
         num_layers=args.num_layers,
     ).to(device)
+    save_initial_embeddings(model_bert4rec)
     if use_dmp:
         fused_params: Dict[str, Any] = {}
         fused_params["optimizer"] = EmbOptimType.ADAM
@@ -559,6 +596,8 @@ def main(argv: List[str]) -> None:
         metric_ks,
         args.export_root,
     )
+    total_change_bytes, total_change_gb = calculate_embedding_changes(model_bert4rec)
+    print(f"Embedding param change: {total_change_bytes} bytes ({total_change_gb:.2f} GB)")
 
 
 if __name__ == "__main__":
