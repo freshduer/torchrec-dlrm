@@ -73,6 +73,7 @@ def main(argv: List[str]) -> None:
         in_file_path = os.path.join(input_dir, input)
         if not os.path.exists(in_file_path):
             continue
+        print(f"Processing {in_file_path}.")
         dense_out_file_path = os.path.join(output_dir, output + "_dense.npy")
         sparse_out_file_path = os.path.join(output_dir, output + "_sparse.npy")
         labels_out_file_path = os.path.join(output_dir, output + "_labels.npy")
